@@ -1,6 +1,6 @@
 """
 Club 24 Blink Tailgate Detection System
-Continuous scanning + Email alerts via Google Apps Script
+Analyzes recorded clips from Blink library + Email alerts
 """
 
 import os
@@ -8,6 +8,7 @@ import json
 import asyncio
 import csv
 import base64
+import subprocess
 import aiohttp
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -63,50 +64,45 @@ async def send_alert_email(camera_name, people_count, scores, recipient, motion_
         now = now_et()
         time_str = now.strftime("%I:%M %p ET")
         date_str = now.strftime("%A, %B %d, %Y")
-        conf_str = ", ".join([str(round(s * 100)) + "%" for s in scores])
+        conf_str = ", ".join([str(round(s * 100)) + "pct" for s in scores])
+        motion_str = str(motion_time) if motion_time else "N/A"
 
         subject = "TAILGATE ALERT - " + camera_name + " - " + str(people_count) + " people detected"
 
-        html = (
-            '<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">'
-            '<div style="background:#E24B4A;color:white;padding:20px;border-radius:8px 8px 0 0;">'
-            '<h1 style="margin:0;font-size:22px;">TAILGATE ALERT</h1>'
-            '<p style="margin:5px 0 0;opacity:0.9;">Club 24 Security</p></div>'
-            '<div style="background:white;padding:20px;border:1px solid #ddd;border-radius:0 0 8px 8px;">'
-            '<div style="background:#FFF3F3;border-left:4px solid #E24B4A;padding:15px;margin-bottom:20px;">'
-            '<h2 style="margin:0 0 10px;color:#E24B4A;">' + str(people_count) + ' People Detected</h2>'
-            '<p style="margin:0;"><strong>Location:</strong> ' + camera_name + '</p>'
-            '<p style="margin:5px 0;"><strong>Time:</strong> ' + time_str + '</p>'
-            '<p style="margin:5px 0;"><strong>Date:</strong> ' + date_str + '</p>'
-            '<p style="margin:5px 0;"><strong>Confidence:</strong> ' + conf_str + '</p>'
-            + ('<p style="margin:5px 0;"><strong>Motion Detected:</strong> ' + str(motion_time) + '</p>' if motion_time else '')
-            '</div>'
-            '<p style="color:#E24B4A;font-weight:bold;font-size:16px;">'
-            'ACTION REQUIRED: Open the Blink app to review footage now.</p>'
-            '<hr style="border:none;border-top:1px solid #eee;margin:20px 0;">'
-            '<p style="color:#999;font-size:12px;">'
-            'Club 24 Tailgate Detection System</p>'
-            '</div></div>'
-        )
+        html_parts = []
+        html_parts.append('<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">')
+        html_parts.append('<div style="background:#E24B4A;color:white;padding:20px;border-radius:8px 8px 0 0;">')
+        html_parts.append('<h1 style="margin:0;font-size:22px;">TAILGATE ALERT</h1>')
+        html_parts.append('<p style="margin:5px 0 0;opacity:0.9;">Club 24 Security</p></div>')
+        html_parts.append('<div style="background:white;padding:20px;border:1px solid #ddd;border-radius:0 0 8px 8px;">')
+        html_parts.append('<div style="background:#FFF3F3;border-left:4px solid #E24B4A;padding:15px;margin-bottom:20px;">')
+        html_parts.append('<h2 style="margin:0 0 10px;color:#E24B4A;">' + str(people_count) + ' People Detected</h2>')
+        html_parts.append('<p style="margin:0;"><strong>Location:</strong> ' + camera_name + '</p>')
+        html_parts.append('<p style="margin:5px 0;"><strong>Alert Time:</strong> ' + time_str + '</p>')
+        html_parts.append('<p style="margin:5px 0;"><strong>Motion Recorded:</strong> ' + motion_str + '</p>')
+        html_parts.append('<p style="margin:5px 0;"><strong>Date:</strong> ' + date_str + '</p>')
+        html_parts.append('<p style="margin:5px 0;"><strong>Confidence:</strong> ' + conf_str + '</p>')
+        html_parts.append('</div>')
+        html_parts.append('<p style="color:#E24B4A;font-weight:bold;font-size:16px;">')
+        html_parts.append('ACTION REQUIRED: Open the Blink app to review footage now.</p>')
+        html_parts.append('<hr style="border:none;border-top:1px solid #eee;margin:20px 0;">')
+        html_parts.append('<p style="color:#999;font-size:12px;">')
+        html_parts.append('Club 24 Tailgate Detection System</p>')
+        html_parts.append('</div></div>')
+        html = "".join(html_parts)
 
-        text = "TAILGATE ALERT - " + camera_name + " - " + str(people_count) + " people at " + time_str + (" | Motion: " + str(motion_time) if motion_time else "")
+        text = "TAILGATE ALERT - " + camera_name + " - " + str(people_count) + " people at " + time_str + " | Motion: " + motion_str
 
-        payload = {
-            "to": recipient,
-            "subject": subject,
-            "text": text,
-            "html": html
-        }
+        payload = {"to": recipient, "subject": subject, "text": text, "html": html}
 
         async with aiohttp.ClientSession() as session:
             async with session.post(EMAIL_WEBHOOK, json=payload, allow_redirects=True) as resp:
-                logger.info("Email webhook response: " + str(resp.status))
                 if resp.status == 200 or resp.status == 302:
                     logger.info("EMAIL SENT to " + recipient + " for " + camera_name)
                     return True
                 else:
                     body = await resp.text()
-                    logger.error("Email webhook error: " + str(resp.status) + " - " + body)
+                    logger.error("Email webhook error: " + str(resp.status))
                     return False
     except Exception as e:
         logger.error("Email error: " + str(e))
@@ -185,73 +181,8 @@ class BlinkManager:
             logger.error("Thumbnail error: " + str(e))
             return None
 
-    async def get_video_frame(self, camera_name):
-        """Download latest video clip and extract a frame"""
-        try:
-            if not self.blink or camera_name not in self.blink.cameras:
-                return None
-            camera = self.blink.cameras[camera_name]
-
-            # Snap a fresh picture
-            try:
-                await camera.snap_picture()
-                await asyncio.sleep(5)
-                await self.blink.refresh()
-            except Exception as e:
-                logger.warning("Snap failed for " + camera_name + ": " + str(e))
-
-            # Try to get fresh thumbnail after snap
-            tmp_path = "/tmp/" + camera_name.replace(" ", "_") + "_fresh.jpg"
-            try:
-                await camera.image_to_file(tmp_path)
-                if Path(tmp_path).exists() and Path(tmp_path).stat().st_size > 100:
-                    with open(tmp_path, "rb") as fh:
-                        return fh.read()
-            except Exception as e:
-                logger.warning("Fresh image failed: " + str(e))
-
-            # Fallback to existing thumbnail
-            return await self.get_camera_thumbnail(camera_name)
-        except Exception as e:
-            logger.error("Video frame error for " + camera_name + ": " + str(e))
-            return None
-
-    async def get_recent_clips(self, camera_name=None):
-        """Get recent recorded clips from Blink media library"""
-        clips = []
-        try:
-            if not self.blink or not self.authenticated:
-                return clips
-            await self.blink.refresh()
-
-            cameras_to_check = {}
-            if camera_name and camera_name in self.blink.cameras:
-                cameras_to_check = {camera_name: self.blink.cameras[camera_name]}
-            else:
-                for cam_name in ALERT_CAMERAS:
-                    if cam_name in self.blink.cameras:
-                        cameras_to_check[cam_name] = self.blink.cameras[cam_name]
-
-            for name, camera in cameras_to_check.items():
-                clip_url = camera.clip
-                last_motion = camera.last_motion
-                motion_detected = camera.motion_detected
-
-                if clip_url:
-                    clips.append({
-                        "camera_name": name,
-                        "clip_url": clip_url,
-                        "last_motion": str(last_motion) if last_motion else None,
-                        "motion_detected": motion_detected
-                    })
-
-            return clips
-        except Exception as e:
-            logger.error("Get clips error: " + str(e))
-            return clips
-
     async def download_clip_frame(self, camera_name):
-        """Download a video clip and extract a frame using ffmpeg"""
+        """Download recorded clip from library and extract a frame"""
         try:
             if not self.blink or camera_name not in self.blink.cameras:
                 return None
@@ -260,10 +191,8 @@ class BlinkManager:
             clip_url = camera.clip
 
             if not clip_url:
-                logger.info("No clip for " + camera_name + " - using thumbnail")
                 return await self.get_camera_thumbnail(camera_name)
 
-            # Download the video clip
             video_path = "/tmp/" + camera_name.replace(" ", "_") + "_clip.mp4"
             frame_path = "/tmp/" + camera_name.replace(" ", "_") + "_frame.jpg"
 
@@ -274,42 +203,36 @@ class BlinkManager:
                 return await self.get_camera_thumbnail(camera_name)
 
             if not Path(video_path).exists() or Path(video_path).stat().st_size < 100:
-                logger.warning("Video file empty for " + camera_name)
                 return await self.get_camera_thumbnail(camera_name)
 
-            # Extract frame from middle of video using ffmpeg
-            import subprocess
             try:
-                # Get video duration
                 probe = subprocess.run(
                     ["ffprobe", "-v", "error", "-show_entries", "format=duration",
                      "-of", "default=noprint_wrappers=1:nokey=1", video_path],
                     capture_output=True, text=True, timeout=10
                 )
                 duration = float(probe.stdout.strip()) if probe.stdout.strip() else 5.0
-                midpoint = duration / 2
+                midpoint = str(duration / 2)
 
-                # Extract frame at midpoint
                 subprocess.run(
-                    ["ffmpeg", "-y", "-ss", str(midpoint), "-i", video_path,
+                    ["ffmpeg", "-y", "-ss", midpoint, "-i", video_path,
                      "-vframes", "1", "-q:v", "2", frame_path],
                     capture_output=True, timeout=15
                 )
 
                 if Path(frame_path).exists() and Path(frame_path).stat().st_size > 100:
                     with open(frame_path, "rb") as fh:
-                        logger.info("Extracted frame from clip for " + camera_name)
+                        logger.info("Extracted frame from clip: " + camera_name)
                         return fh.read()
             except FileNotFoundError:
-                logger.warning("ffmpeg not installed - using thumbnail")
+                logger.warning("ffmpeg not available - using thumbnail")
             except Exception as e:
                 logger.warning("Frame extraction failed: " + str(e))
 
-            # Fallback to thumbnail
             return await self.get_camera_thumbnail(camera_name)
 
         except Exception as e:
-            logger.error("Clip frame error for " + camera_name + ": " + str(e))
+            logger.error("Clip frame error: " + str(e))
             return await self.get_camera_thumbnail(camera_name)
 
     async def get_latest_videos(self, camera_name=None):
@@ -420,7 +343,6 @@ async def continuous_scan_loop():
                 continue
 
             if not blink_mgr.authenticated:
-                logger.warning("Not authenticated - retrying in 60s")
                 await asyncio.sleep(60)
                 continue
 
@@ -434,7 +356,7 @@ async def continuous_scan_loop():
                     if cam_name not in blink_mgr.blink.cameras:
                         continue
 
-                    image_data = await blink_mgr.get_video_frame(cam_name)
+                    image_data = await blink_mgr.download_clip_frame(cam_name)
                     if not image_data:
                         continue
 
@@ -478,7 +400,6 @@ async def startup_event():
     logger.info("Club 24 Tailgate Detector Starting...")
     await blink_mgr.authenticate()
     asyncio.create_task(continuous_scan_loop())
-    logger.info("Background scan loop started")
 
 
 @app.get("/health")
@@ -514,7 +435,7 @@ async def list_cameras():
 async def analyze_camera(camera_name: str):
     if not blink_mgr.authenticated:
         return {"error": "Not authenticated"}
-    image_data = await blink_mgr.get_camera_thumbnail(camera_name)
+    image_data = await blink_mgr.download_clip_frame(camera_name)
     if not image_data:
         return {"error": "No image from " + camera_name}
     result = await vision_api.count_people(image_data)
@@ -609,15 +530,14 @@ async def get_stats():
 async def get_schedule():
     return {
         "unstaffed_hours": {
-            "mon_fri": "9:00 PM to 8:00 AM ET",
-            "sat_sun": "3:00 PM to 8:00 AM ET"
+            "mon_fri": "9 PM to 8 AM ET",
+            "sat_sun": "3 PM to 8 AM ET"
         },
         "scan_interval_seconds": SCAN_INTERVAL_SECONDS,
         "alert_cameras": ALERT_CAMERAS,
         "people_threshold": PEOPLE_THRESHOLD,
         "currently_unstaffed": is_unstaffed_hours(),
-        "email_webhook": "Google Apps Script",
-        "mode": "Continuous background scanning"
+        "mode": "Continuous background scanning with clip analysis"
     }
 
 
