@@ -212,6 +212,20 @@ async def startup_event():
     await blink_mgr.authenticate()
 
 
+
+@app.post("/login")
+async def login():
+    """Trigger fresh Blink login - will send new 2FA PIN"""
+    blink_mgr.blink = None
+    blink_mgr.authenticated = False
+    blink_mgr.pending_2fa = False
+    await blink_mgr.authenticate()
+    return {
+        "authenticated": blink_mgr.authenticated,
+        "pending_2fa": blink_mgr.pending_2fa,
+        "hint": "Check email for PIN, then POST /verify-2fa?pin=XXXXXX"
+    }
+
 @app.get("/health")
 async def health_check():
     return {
