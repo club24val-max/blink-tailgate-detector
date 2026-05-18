@@ -1,8 +1,3 @@
-"""
-Club 24 Blink Tailgate Detection System
-Analyzes recorded clips from Blink library + Email alerts
-"""
-
 import os
 import json
 import asyncio
@@ -10,11 +5,10 @@ import csv
 import base64
 import subprocess
 import aiohttp
+import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
-import logging
-
 from aiohttp import ClientSession
 from blinkpy.blinkpy import Blink
 from blinkpy.auth import Auth
@@ -31,8 +25,10 @@ VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")
 PEOPLE_THRESHOLD = 2
 CONFIDENCE_THRESHOLD = 0.5
 SCAN_INTERVAL_SECONDS = 120
-
-EMAIL_WEBHOOK = "https://script.google.com/macros/s/AKfycbzWr-xlOnq2ayUuFuU8ruJ3jRl4SItNRtmAD8wZY4vwq6AwTpw_XoVusyN5FjyyQSJ1/exec"
+EMAIL_WEBHOOK = (
+    "https://script.google.com/macros/s/"
+    "AKfycbzWr-xlOnq2ayUuFuU8ruJ3jRl4SItNRtmAD8wZY4vwq6AwTpw_XoVusyN5FjyyQSJ1/exec"
+)
 
 ALERT_CAMERAS = {
     "Wallingford Front Door": "club24wf@gmail.com",
@@ -46,64 +42,74 @@ ALERT_CAMERAS = {
 
 ET = timezone(timedelta(hours=-4))
 
+
 def now_et():
     return datetime.now(ET)
 
+
 def is_unstaffed_hours():
     now = now_et()
-    hour = now.hour
-    weekday = now.weekday()
-    if weekday < 5:
-        return hour >= 21 or hour < 8
+    h = now.hour
+    wd = now.weekday()
+    if wd < 5:
+        return h >= 21 or h < 8
     else:
-        return hour >= 15 or hour < 8
+        return h >= 15 or h < 8
 
 
-async def send_alert_email(camera_name, people_count, scores, recipient, motion_time=None):
+def build_alert_html(cam, count, ts, ds, cs, ms):
+    parts = [
+        '<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">',
+        '<div style="background:#E24B4A;color:white;padding:20px;border-radius:8px 8px 0 0;">',
+        '<h1 style="margin:0;font-size:22px;">TAILGATE ALERT</h1>',
+        '<p style="margin:5px 0 0;opacity:0.9;">Club 24 Security</p></div>',
+        '<div style="background:white;padding:20px;border:1px solid #ddd;border-radius:0 0 8px 8px;">',
+        '<div style="background:#FFF3F3;border-left:4px solid #E24B4A;padding:15px;margin-bottom:20px;">',
+        '<h2 style="margin:0 0 10px;color:#E24B4A;">',
+        str(count),
+        " People Detected</h2>",
+        "<p><strong>Location:</strong> ",
+        cam,
+        "</p>",
+        "<p><strong>Alert Time:</strong> ",
+        ts,
+        "</p>",
+        "<p><strong>Motion Recorded:</strong> ",
+        ms,
+        "</p>",
+        "<p><strong>Date:</strong> ",
+        ds,
+        "</p>",
+        "<p><strong>Confidence:</strong> ",
+        cs,
+        "</p></div>",
+        '<p style="color:#E24B4A;font-weight:bold;font-size:16px;">',
+        "ACTION REQUIRED: Open the Blink app to review footage now.</p>",
+        '<hr style="border:none;border-top:1px solid #eee;margin:20px 0;">',
+        '<p style="color:#999;font-size:12px;">',
+        "Club 24 Tailgate Detection System</p>",
+        "</div></div>",
+    ]
+    return "".join(parts)
+
+
+async def send_alert_email(cam, count, scores, to, motion_time=None):
     try:
         now = now_et()
-        time_str = now.strftime("%I:%M %p ET")
-        date_str = now.strftime("%A, %B %d, %Y")
-        conf_str = ", ".join([str(round(s * 100)) + "pct" for s in scores])
-        motion_str = str(motion_time) if motion_time else "N/A"
-
-        subject = "TAILGATE ALERT - " + camera_name + " - " + str(people_count) + " people detected"
-
-        html_parts = []
-        html_parts.append('<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">')
-        html_parts.append('<div style="background:#E24B4A;color:white;padding:20px;border-radius:8px 8px 0 0;">')
-        html_parts.append('<h1 style="margin:0;font-size:22px;">TAILGATE ALERT</h1>')
-        html_parts.append('<p style="margin:5px 0 0;opacity:0.9;">Club 24 Security</p></div>')
-        html_parts.append('<div style="background:white;padding:20px;border:1px solid #ddd;border-radius:0 0 8px 8px;">')
-        html_parts.append('<div style="background:#FFF3F3;border-left:4px solid #E24B4A;padding:15px;margin-bottom:20px;">')
-        html_parts.append('<h2 style="margin:0 0 10px;color:#E24B4A;">' + str(people_count) + ' People Detected</h2>')
-        html_parts.append('<p style="margin:0;"><strong>Location:</strong> ' + camera_name + '</p>')
-        html_parts.append('<p style="margin:5px 0;"><strong>Alert Time:</strong> ' + time_str + '</p>')
-        html_parts.append('<p style="margin:5px 0;"><strong>Motion Recorded:</strong> ' + motion_str + '</p>')
-        html_parts.append('<p style="margin:5px 0;"><strong>Date:</strong> ' + date_str + '</p>')
-        html_parts.append('<p style="margin:5px 0;"><strong>Confidence:</strong> ' + conf_str + '</p>')
-        html_parts.append('</div>')
-        html_parts.append('<p style="color:#E24B4A;font-weight:bold;font-size:16px;">')
-        html_parts.append('ACTION REQUIRED: Open the Blink app to review footage now.</p>')
-        html_parts.append('<hr style="border:none;border-top:1px solid #eee;margin:20px 0;">')
-        html_parts.append('<p style="color:#999;font-size:12px;">')
-        html_parts.append('Club 24 Tailgate Detection System</p>')
-        html_parts.append('</div></div>')
-        html = "".join(html_parts)
-
-        text = "TAILGATE ALERT - " + camera_name + " - " + str(people_count) + " people at " + time_str + " | Motion: " + motion_str
-
-        payload = {"to": recipient, "subject": subject, "text": text, "html": html}
-
+        ts = now.strftime("%I:%M %p ET")
+        ds = now.strftime("%A, %B %d, %Y")
+        cs = ", ".join([str(round(s * 100)) + "%" for s in scores])
+        ms = str(motion_time) if motion_time else "N/A"
+        subj = "TAILGATE ALERT - " + cam + " - " + str(count) + " people detected"
+        html = build_alert_html(cam, count, ts, ds, cs, ms)
+        text = subj + " at " + ts + " | Motion: " + ms
+        payload = {"to": to, "subject": subj, "text": text, "html": html}
         async with aiohttp.ClientSession() as session:
-            async with session.post(EMAIL_WEBHOOK, json=payload, allow_redirects=True) as resp:
-                if resp.status == 200 or resp.status == 302:
-                    logger.info("EMAIL SENT to " + recipient + " for " + camera_name)
-                    return True
-                else:
-                    body = await resp.text()
-                    logger.error("Email webhook error: " + str(resp.status))
-                    return False
+            async with session.post(
+                EMAIL_WEBHOOK, json=payload, allow_redirects=True
+            ) as resp:
+                logger.info("Email response: " + str(resp.status))
+                return resp.status == 200 or resp.status == 302
     except Exception as e:
         logger.error("Email error: " + str(e))
         return False
@@ -148,19 +154,21 @@ class BlinkManager:
                 return
             await self.blink.refresh()
             self.cameras_discovered = {}
-            for sync_name, sync_module in self.blink.sync.items():
-                self.cameras_discovered[sync_name] = {
-                    "network_id": sync_module.network_id,
-                    "cameras": []
+            for sn, sm in self.blink.sync.items():
+                self.cameras_discovered[sn] = {
+                    "network_id": sm.network_id,
+                    "cameras": [],
                 }
-            for cam_name, camera in self.blink.cameras.items():
-                for sync_name, sync_data in self.cameras_discovered.items():
-                    if sync_data["network_id"] == camera.network_id:
-                        sync_data["cameras"].append({
-                            "name": cam_name,
-                            "camera_id": camera.camera_id,
-                            "network_id": camera.network_id
-                        })
+            for cn, cam in self.blink.cameras.items():
+                for sn, sd in self.cameras_discovered.items():
+                    if sd["network_id"] == cam.network_id:
+                        sd["cameras"].append(
+                            {
+                                "name": cn,
+                                "camera_id": cam.camera_id,
+                                "network_id": cam.network_id,
+                            }
+                        )
                         break
             logger.info("Discovered " + str(len(self.blink.cameras)) + " cameras")
         except Exception as e:
@@ -171,10 +179,10 @@ class BlinkManager:
             if not self.blink or camera_name not in self.blink.cameras:
                 return None
             camera = self.blink.cameras[camera_name]
-            tmp_path = "/tmp/" + camera_name.replace(" ", "_") + "_thumb.jpg"
-            await camera.image_to_file(tmp_path)
-            if Path(tmp_path).exists():
-                with open(tmp_path, "rb") as fh:
+            tmp = "/tmp/" + camera_name.replace(" ", "_") + "_thumb.jpg"
+            await camera.image_to_file(tmp)
+            if Path(tmp).exists():
+                with open(tmp, "rb") as fh:
                     return fh.read()
             return None
         except Exception as e:
@@ -182,55 +190,66 @@ class BlinkManager:
             return None
 
     async def download_clip_frame(self, camera_name):
-        """Download recorded clip from library and extract a frame"""
         try:
             if not self.blink or camera_name not in self.blink.cameras:
                 return None
-
             camera = self.blink.cameras[camera_name]
             clip_url = camera.clip
-
             if not clip_url:
                 return await self.get_camera_thumbnail(camera_name)
-
-            video_path = "/tmp/" + camera_name.replace(" ", "_") + "_clip.mp4"
-            frame_path = "/tmp/" + camera_name.replace(" ", "_") + "_frame.jpg"
-
+            vpath = "/tmp/" + camera_name.replace(" ", "_") + "_clip.mp4"
+            fpath = "/tmp/" + camera_name.replace(" ", "_") + "_frame.jpg"
             try:
-                await camera.video_to_file(video_path)
+                await camera.video_to_file(vpath)
             except Exception as e:
-                logger.warning("Video download failed for " + camera_name + ": " + str(e))
+                logger.warning("Video DL failed " + camera_name + ": " + str(e))
                 return await self.get_camera_thumbnail(camera_name)
-
-            if not Path(video_path).exists() or Path(video_path).stat().st_size < 100:
+            if not Path(vpath).exists() or Path(vpath).stat().st_size < 100:
                 return await self.get_camera_thumbnail(camera_name)
-
             try:
                 probe = subprocess.run(
-                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                     "-of", "default=noprint_wrappers=1:nokey=1", video_path],
-                    capture_output=True, text=True, timeout=10
+                    [
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-show_entries",
+                        "format=duration",
+                        "-of",
+                        "default=noprint_wrappers=1:nokey=1",
+                        vpath,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
                 )
-                duration = float(probe.stdout.strip()) if probe.stdout.strip() else 5.0
-                midpoint = str(duration / 2)
-
+                dur = float(probe.stdout.strip()) if probe.stdout.strip() else 5.0
+                mid = str(dur / 2)
                 subprocess.run(
-                    ["ffmpeg", "-y", "-ss", midpoint, "-i", video_path,
-                     "-vframes", "1", "-q:v", "2", frame_path],
-                    capture_output=True, timeout=15
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-ss",
+                        mid,
+                        "-i",
+                        vpath,
+                        "-vframes",
+                        "1",
+                        "-q:v",
+                        "2",
+                        fpath,
+                    ],
+                    capture_output=True,
+                    timeout=15,
                 )
-
-                if Path(frame_path).exists() and Path(frame_path).stat().st_size > 100:
-                    with open(frame_path, "rb") as fh:
-                        logger.info("Extracted frame from clip: " + camera_name)
+                if Path(fpath).exists() and Path(fpath).stat().st_size > 100:
+                    with open(fpath, "rb") as fh:
+                        logger.info("Frame from clip: " + camera_name)
                         return fh.read()
             except FileNotFoundError:
-                logger.warning("ffmpeg not available - using thumbnail")
+                logger.warning("ffmpeg not available")
             except Exception as e:
-                logger.warning("Frame extraction failed: " + str(e))
-
+                logger.warning("Frame extract failed: " + str(e))
             return await self.get_camera_thumbnail(camera_name)
-
         except Exception as e:
             logger.error("Clip frame error: " + str(e))
             return await self.get_camera_thumbnail(camera_name)
@@ -247,14 +266,18 @@ class BlinkManager:
             else:
                 cams = self.blink.cameras
             for name, camera in cams.items():
-                videos.append({
-                    "camera_name": name,
-                    "camera_id": camera.camera_id,
-                    "network_id": camera.network_id,
-                    "clip": camera.clip,
-                    "last_motion": str(camera.last_motion) if camera.last_motion else None,
-                    "motion_detected": camera.motion_detected
-                })
+                videos.append(
+                    {
+                        "camera_name": name,
+                        "camera_id": camera.camera_id,
+                        "network_id": camera.network_id,
+                        "clip": camera.clip,
+                        "last_motion": str(camera.last_motion)
+                        if camera.last_motion
+                        else None,
+                        "motion_detected": camera.motion_detected,
+                    }
+                )
             return videos
         except Exception as e:
             logger.error("Videos error: " + str(e))
@@ -264,7 +287,9 @@ class BlinkManager:
 class VisionAnalyzer:
     def __init__(self):
         self.api_key = VISION_API_KEY
-        self.api_url = "https://vision.googleapis.com/v1/images:annotate?key=" + self.api_key
+        self.api_url = (
+            "https://vision.googleapis.com/v1/images:annotate?key=" + self.api_key
+        )
         self.available = bool(self.api_key)
 
     async def count_people(self, image_data):
@@ -273,10 +298,14 @@ class VisionAnalyzer:
         try:
             b64 = base64.b64encode(image_data).decode("utf-8")
             payload = {
-                "requests": [{
-                    "image": {"content": b64},
-                    "features": [{"type": "OBJECT_LOCALIZATION", "maxResults": 20}]
-                }]
+                "requests": [
+                    {
+                        "image": {"content": b64},
+                        "features": [
+                            {"type": "OBJECT_LOCALIZATION", "maxResults": 20}
+                        ],
+                    }
+                ]
             }
             async with aiohttp.ClientSession() as session:
                 async with session.post(self.api_url, json=payload) as resp:
@@ -284,16 +313,18 @@ class VisionAnalyzer:
                         return {"people_count": 0, "error": "API " + str(resp.status)}
                     data = await resp.json()
             response = data.get("responses", [{}])[0]
-            people_count = 0
+            count = 0
             scores = []
             for obj in response.get("localizedObjectAnnotations", []):
-                if obj.get("name", "").lower() == "person" and obj.get("score", 0) >= CONFIDENCE_THRESHOLD:
-                    people_count += 1
-                    scores.append(round(obj["score"], 3))
+                nm = obj.get("name", "").lower()
+                sc = obj.get("score", 0)
+                if nm == "person" and sc >= CONFIDENCE_THRESHOLD:
+                    count += 1
+                    scores.append(round(sc, 3))
             return {
-                "people_count": people_count,
+                "people_count": count,
                 "person_scores": scores,
-                "is_tailgate": people_count >= PEOPLE_THRESHOLD
+                "is_tailgate": count >= PEOPLE_THRESHOLD,
             }
         except Exception as e:
             logger.error("Vision error: " + str(e))
@@ -303,23 +334,32 @@ class VisionAnalyzer:
 class EventLogger:
     @staticmethod
     def log_event(location, camera, people_count, confidence, email_sent=False):
-        file_exists = Path(TAILGATE_LOG_CSV).exists()
+        exists = Path(TAILGATE_LOG_CSV).exists()
         try:
             with open(TAILGATE_LOG_CSV, "a", newline="") as fh:
-                writer = csv.DictWriter(fh, fieldnames=[
-                    "timestamp", "location", "camera_name", "people_count",
-                    "confidence", "email_sent"
-                ])
-                if not file_exists:
-                    writer.writeheader()
-                writer.writerow({
-                    "timestamp": now_et().isoformat(),
-                    "location": location,
-                    "camera_name": camera,
-                    "people_count": people_count,
-                    "confidence": confidence,
-                    "email_sent": email_sent
-                })
+                w = csv.DictWriter(
+                    fh,
+                    fieldnames=[
+                        "timestamp",
+                        "location",
+                        "camera_name",
+                        "people_count",
+                        "confidence",
+                        "email_sent",
+                    ],
+                )
+                if not exists:
+                    w.writeheader()
+                w.writerow(
+                    {
+                        "timestamp": now_et().isoformat(),
+                        "location": location,
+                        "camera_name": camera,
+                        "people_count": people_count,
+                        "confidence": confidence,
+                        "email_sent": email_sent,
+                    }
+                )
         except Exception as e:
             logger.error("Log error: " + str(e))
 
@@ -327,13 +367,17 @@ class EventLogger:
 blink_mgr = BlinkManager()
 vision_api = VisionAnalyzer()
 event_logger = EventLogger()
-scan_stats = {"total_scans": 0, "last_scan": None, "alerts_sent": 0, "running": False}
+scan_stats = {
+    "total_scans": 0,
+    "last_scan": None,
+    "alerts_sent": 0,
+    "running": False,
+}
 
 
 async def continuous_scan_loop():
     scan_stats["running"] = True
-    logger.info("Continuous scan loop started")
-
+    logger.info("Scan loop started")
     while True:
         try:
             if not is_unstaffed_hours():
@@ -341,52 +385,47 @@ async def continuous_scan_loop():
                 logger.info("Staffed hours - sleeping 5 min")
                 await asyncio.sleep(300)
                 continue
-
             if not blink_mgr.authenticated:
                 await asyncio.sleep(60)
                 continue
-
             scan_stats["running"] = True
-            logger.info("Scanning cameras at " + now_et().strftime("%I:%M %p ET"))
-
+            logger.info("Scanning at " + now_et().strftime("%I:%M %p ET"))
             await blink_mgr.blink.refresh()
-
             for cam_name in ALERT_CAMERAS:
                 try:
                     if cam_name not in blink_mgr.blink.cameras:
                         continue
-
                     image_data = await blink_mgr.download_clip_frame(cam_name)
                     if not image_data:
                         continue
-
                     result = await vision_api.count_people(image_data)
                     people = result.get("people_count", 0)
                     scores = result.get("person_scores", [])
-
                     if result.get("is_tailgate"):
                         recipient = ALERT_CAMERAS[cam_name]
-                        avg_conf = sum(scores) / max(len(scores), 1)
-                        motion_time = str(blink_mgr.blink.cameras[cam_name].last_motion) if blink_mgr.blink.cameras[cam_name].last_motion else None
-
-                        email_sent = await send_alert_email(cam_name, people, scores, recipient, motion_time)
-
+                        avg = sum(scores) / max(len(scores), 1)
+                        cam_obj = blink_mgr.blink.cameras[cam_name]
+                        mt = str(cam_obj.last_motion) if cam_obj.last_motion else None
+                        sent = await send_alert_email(
+                            cam_name, people, scores, recipient, mt
+                        )
                         event_logger.log_event(
-                            location=cam_name, camera=cam_name,
-                            people_count=people, confidence=round(avg_conf, 3),
-                            email_sent=email_sent
+                            cam_name, cam_name, people, round(avg, 3), sent
                         )
                         scan_stats["alerts_sent"] += 1
-                        logger.warning("TAILGATE: " + cam_name + " - " + str(people) + " people - email: " + str(email_sent))
-
+                        logger.warning(
+                            "TAILGATE: "
+                            + cam_name
+                            + " - "
+                            + str(people)
+                            + " people - email: "
+                            + str(sent)
+                        )
                 except Exception as e:
                     logger.error("Scan error " + cam_name + ": " + str(e))
-
             scan_stats["total_scans"] += 1
             scan_stats["last_scan"] = now_et().isoformat()
-
             await asyncio.sleep(SCAN_INTERVAL_SECONDS)
-
         except Exception as e:
             logger.error("Loop error: " + str(e))
             await asyncio.sleep(30)
@@ -409,14 +448,16 @@ async def health_check():
         "blink_authenticated": blink_mgr.authenticated,
         "vision_api": vision_api.available,
         "email_webhook": bool(EMAIL_WEBHOOK),
-        "cameras": len(blink_mgr.blink.cameras) if blink_mgr.blink and blink_mgr.blink.cameras else 0,
+        "cameras": len(blink_mgr.blink.cameras)
+        if blink_mgr.blink and blink_mgr.blink.cameras
+        else 0,
         "account_id": blink_mgr.blink.account_id if blink_mgr.blink else None,
         "current_time_et": now_et().strftime("%I:%M %p ET - %A"),
         "is_unstaffed": is_unstaffed_hours(),
         "scan_loop_running": scan_stats["running"],
         "total_scans": scan_stats["total_scans"],
         "last_scan": scan_stats["last_scan"],
-        "alerts_sent": scan_stats["alerts_sent"]
+        "alerts_sent": scan_stats["alerts_sent"],
     }
 
 
@@ -427,7 +468,7 @@ async def list_cameras():
     return {
         "total_cameras": len(blink_mgr.blink.cameras),
         "alert_cameras": ALERT_CAMERAS,
-        "sync_modules": blink_mgr.cameras_discovered
+        "sync_modules": blink_mgr.cameras_discovered,
     }
 
 
@@ -439,18 +480,20 @@ async def analyze_camera(camera_name: str):
     if not image_data:
         return {"error": "No image from " + camera_name}
     result = await vision_api.count_people(image_data)
-    return {"camera": camera_name, "timestamp": now_et().isoformat(), "analysis": result}
+    return {
+        "camera": camera_name,
+        "timestamp": now_et().isoformat(),
+        "analysis": result,
+    }
 
 
 @app.post("/scan-all")
 async def scan_all_cameras():
     if not blink_mgr.authenticated:
         return {"error": "Not authenticated"}
-
     await blink_mgr.blink.refresh()
     results = []
     alerts = []
-
     for cam_name, camera in blink_mgr.blink.cameras.items():
         try:
             image_data = await blink_mgr.download_clip_frame(cam_name)
@@ -460,38 +503,48 @@ async def scan_all_cameras():
             analysis = await vision_api.count_people(image_data)
             people = analysis.get("people_count", 0)
             scores = analysis.get("person_scores", [])
-            is_alert_cam = cam_name in ALERT_CAMERAS
-            is_tailgate = analysis.get("is_tailgate", False)
-
+            is_ac = cam_name in ALERT_CAMERAS
+            is_tg = analysis.get("is_tailgate", False)
             status = "clear"
-            if is_tailgate and is_alert_cam:
+            if is_tg and is_ac:
                 status = "TAILGATE_ALERT"
-                recipient = ALERT_CAMERAS[cam_name]
-                avg_conf = sum(scores) / max(len(scores), 1)
-                motion_time = str(camera.last_motion) if camera.last_motion else None
-                email_sent = await send_alert_email(cam_name, people, scores, recipient, motion_time)
-                event_logger.log_event(cam_name, cam_name, people, round(avg_conf, 3), email_sent)
-                alerts.append({"camera": cam_name, "people": people, "email_sent": email_sent, "motion_time": motion_time})
-            elif is_tailgate:
+                recip = ALERT_CAMERAS[cam_name]
+                avg = sum(scores) / max(len(scores), 1)
+                mt = str(camera.last_motion) if camera.last_motion else None
+                sent = await send_alert_email(
+                    cam_name, people, scores, recip, mt
+                )
+                event_logger.log_event(
+                    cam_name, cam_name, people, round(avg, 3), sent
+                )
+                alerts.append(
+                    {
+                        "camera": cam_name,
+                        "people": people,
+                        "email_sent": sent,
+                        "motion_time": mt,
+                    }
+                )
+            elif is_tg:
                 status = "people_detected"
-
-            results.append({
-                "camera": cam_name,
-                "is_alert_camera": is_alert_cam,
-                "status": status,
-                "people_count": people,
-                "person_scores": scores
-            })
+            results.append(
+                {
+                    "camera": cam_name,
+                    "is_alert_camera": is_ac,
+                    "status": status,
+                    "people_count": people,
+                    "person_scores": scores,
+                }
+            )
         except Exception as e:
             results.append({"camera": cam_name, "status": "error", "error": str(e)})
-
     return {
         "timestamp": now_et().isoformat(),
         "is_unstaffed": is_unstaffed_hours(),
         "cameras_scanned": len(results),
         "tailgate_alerts": len(alerts),
         "alerts": alerts,
-        "results": results
+        "results": results,
     }
 
 
@@ -531,16 +584,15 @@ async def get_schedule():
     return {
         "unstaffed_hours": {
             "mon_fri": "9 PM to 8 AM ET",
-            "sat_sun": "3 PM to 8 AM ET"
+            "sat_sun": "3 PM to 8 AM ET",
         },
         "scan_interval_seconds": SCAN_INTERVAL_SECONDS,
         "alert_cameras": ALERT_CAMERAS,
         "people_threshold": PEOPLE_THRESHOLD,
         "currently_unstaffed": is_unstaffed_hours(),
-        "mode": "Continuous background scanning with clip analysis"
+        "mode": "Continuous scanning with clip analysis",
     }
 
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=10000)
-# v2
