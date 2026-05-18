@@ -185,6 +185,37 @@ class BlinkManager:
             logger.error("Thumbnail error: " + str(e))
             return None
 
+    async def get_video_frame(self, camera_name):
+        """Download latest video clip and extract a frame"""
+        try:
+            if not self.blink or camera_name not in self.blink.cameras:
+                return None
+            camera = self.blink.cameras[camera_name]
+
+            # Snap a fresh picture
+            try:
+                await camera.snap_picture()
+                await asyncio.sleep(5)
+                await self.blink.refresh()
+            except Exception as e:
+                logger.warning("Snap failed for " + camera_name + ": " + str(e))
+
+            # Try to get fresh thumbnail after snap
+            tmp_path = "/tmp/" + camera_name.replace(" ", "_") + "_fresh.jpg"
+            try:
+                await camera.image_to_file(tmp_path)
+                if Path(tmp_path).exists() and Path(tmp_path).stat().st_size > 100:
+                    with open(tmp_path, "rb") as fh:
+                        return fh.read()
+            except Exception as e:
+                logger.warning("Fresh image failed: " + str(e))
+
+            # Fallback to existing thumbnail
+            return await self.get_camera_thumbnail(camera_name)
+        except Exception as e:
+            logger.error("Video frame error for " + camera_name + ": " + str(e))
+            return None
+
     async def get_latest_videos(self, camera_name=None):
         videos = []
         try:
@@ -307,7 +338,7 @@ async def continuous_scan_loop():
                     if cam_name not in blink_mgr.blink.cameras:
                         continue
 
-                    image_data = await blink_mgr.get_camera_thumbnail(cam_name)
+                    image_data = await blink_mgr.get_video_frame(cam_name)
                     if not image_data:
                         continue
 
