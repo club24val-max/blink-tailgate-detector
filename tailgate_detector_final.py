@@ -1,12 +1,14 @@
 """
 Club 24 Blink Tailgate Detection System
-Uses blinkpy with saved credentials
+With Google Vision API person detection
 """
 
 import os
 import json
 import asyncio
 import csv
+import base64
+import aiohttp
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -25,7 +27,9 @@ logger = logging.getLogger(__name__)
 BLINK_CREDS = os.getenv("BLINK_CREDS", "")
 BLINK_CREDS_FILE = "./blink_credentials.json"
 TAILGATE_LOG_CSV = "./tailgate_events.csv"
-PEOPLE_COUNT_THRESHOLD = 2
+VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")
+PEOPLE_THRESHOLD = 2
+CONFIDENCE_THRESHOLD = 0.5
 
 
 class BlinkManager:
@@ -36,17 +40,14 @@ class BlinkManager:
     
     async def authenticate(self):
         try:
-            # Write creds from env var to file
             if BLINK_CREDS and not Path(BLINK_CREDS_FILE).exists():
                 Path(BLINK_CREDS_FILE).write_text(BLINK_CREDS)
-                logger.info("Wrote credentials from env var")
             
             if not Path(BLINK_CREDS_FILE).exists():
-                logger.warning("No credentials file found")
+                logger.warning("No credentials file")
                 return False
             
             creds = json.loads(Path(BLINK_CREDS_FILE).read_text())
-            
             session = ClientSession()
             self.blink = Blink(session=session)
             auth = Auth(creds, no_prompt=True)
@@ -56,46 +57,31 @@ class BlinkManager:
                 await self.blink.start()
             except Exception as e:
                 logger.warning(f"Start exception: {e}")
-                # Try 2FA flow if needed
-                try:
-                    pin_needed = "2FA" in str(type(e).__name__)
-                    if pin_needed:
-                        logger.error("2FA required - need fresh credentials")
-                        return False
-                except:
-                    pass
                 return False
             
             if self.blink.cameras:
                 self.authenticated = True
                 await self.discover_cameras()
-                # Save refreshed credentials
                 await self.blink.save(BLINK_CREDS_FILE)
-                logger.info("Blink authenticated successfully")
+                logger.info("Blink authenticated")
                 return True
-            else:
-                logger.warning("No cameras found after auth")
-                return False
-                    
+            return False
         except Exception as e:
-            logger.error(f"Authentication error: {e}")
+            logger.error(f"Auth error: {e}")
             return False
     
     async def discover_cameras(self):
         try:
             if not self.blink or not self.authenticated:
                 return
-            
             await self.blink.refresh()
             self.cameras_discovered = {}
-            
             for sync_name, sync_module in self.blink.sync.items():
                 self.cameras_discovered[sync_name] = {
                     "network_id": sync_module.network_id,
                     "armed": sync_module.arm,
                     "cameras": []
                 }
-            
             for cam_name, camera in self.blink.cameras.items():
                 for sync_name, sync_data in self.cameras_discovered.items():
                     if sync_data["network_id"] == camera.network_id:
@@ -106,11 +92,51 @@ class BlinkManager:
                             "model": camera.camera_type
                         })
                         break
-            
-            logger.info(f"Discovered {len(self.blink.cameras)} cameras across {len(self.blink.sync)} sync modules")
-            
+            logger.info(f"Discovered {len(self.blink.cameras)} cameras")
         except Exception as e:
-            logger.error(f"Camera discovery error: {e}")
+            logger.error(f"Discovery error: {e}")
+    
+    async def get_camera_thumbnail(self, camera_name):
+        """Get thumbnail image data from a camera"""
+        try:
+            if not self.blink or camera_name not in self.blink.cameras:
+                return None
+            camera = self.blink.cameras[camera_name]
+            
+            # Save thumbnail to temp file
+            tmp_path = f"/tmp/{camera_name.replace(' ', '_')}_thumb.jpg"
+            await camera.image_to_file(tmp_path)
+            
+            if Path(tmp_path).exists():
+                with open(tmp_path, "rb") as f:
+                    return f.read()
+            return None
+        except Exception as e:
+            logger.error(f"Thumbnail error for {camera_name}: {e}")
+            return None
+    
+    async def snap_and_get_image(self, camera_name):
+        """Take a new photo and return image data"""
+        try:
+            if not self.blink or camera_name not in self.blink.cameras:
+                return None
+            camera = self.blink.cameras[camera_name]
+            
+            # Snap new picture
+            await camera.snap_picture()
+            await self.blink.refresh()
+            
+            # Save to temp file
+            tmp_path = f"/tmp/{camera_name.replace(' ', '_')}_snap.jpg"
+            await camera.image_to_file(tmp_path)
+            
+            if Path(tmp_path).exists():
+                with open(tmp_path, "rb") as f:
+                    return f.read()
+            return None
+        except Exception as e:
+            logger.error(f"Snap error for {camera_name}: {e}")
+            return None
     
     async def get_latest_videos(self, camera_name=None):
         videos = []
@@ -139,6 +165,81 @@ class BlinkManager:
             return videos
 
 
+class VisionAnalyzer:
+    """Analyzes images using Google Vision API REST endpoint"""
+    
+    def __init__(self):
+        self.api_key = VISION_API_KEY
+        self.api_url = f"https://vision.googleapis.com/v1/images:annotate?key={self.api_key}"
+        self.available = bool(self.api_key)
+    
+    async def count_people(self, image_data):
+        """Count people in an image using Vision API"""
+        if not self.available:
+            return {"people_count": 0, "error": "No API key configured"}
+        
+        try:
+            b64_image = base64.b64encode(image_data).decode("utf-8")
+            
+            payload = {
+                "requests": [{
+                    "image": {"content": b64_image},
+                    "features": [
+                        {"type": "OBJECT_LOCALIZATION", "maxResults": 20},
+                        {"type": "LABEL_DETECTION", "maxResults": 10}
+                    ]
+                }]
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.api_url, json=payload) as resp:
+                    if resp.status != 200:
+                        error = await resp.text()
+                        logger.error(f"Vision API error: {resp.status} - {error}")
+                        return {"people_count": 0, "error": f"API error: {resp.status}"}
+                    
+                    data = await resp.json()
+            
+            response = data.get("responses", [{}])[0]
+            
+            # Count people from object localization
+            people_count = 0
+            person_scores = []
+            objects_found = []
+            
+            for obj in response.get("localizedObjectAnnotations", []):
+                name = obj.get("name", "").lower()
+                score = obj.get("score", 0)
+                objects_found.append({"name": obj.get("name"), "score": round(score, 3)})
+                
+                if name == "person" and score >= CONFIDENCE_THRESHOLD:
+                    people_count += 1
+                    person_scores.append(round(score, 3))
+            
+            # Check labels for group indicators
+            labels = []
+            for label in response.get("labelAnnotations", []):
+                labels.append({
+                    "name": label.get("description"),
+                    "score": round(label.get("score", 0), 3)
+                })
+            
+            is_tailgate = people_count >= PEOPLE_THRESHOLD
+            
+            return {
+                "people_count": people_count,
+                "person_scores": person_scores,
+                "is_tailgate": is_tailgate,
+                "objects_found": objects_found,
+                "labels": labels,
+                "threshold": PEOPLE_THRESHOLD
+            }
+            
+        except Exception as e:
+            logger.error(f"Vision analysis error: {e}")
+            return {"people_count": 0, "error": str(e)}
+
+
 class EventLogger:
     @staticmethod
     def log_event(location, camera, people_count, confidence, video_url=None):
@@ -159,12 +260,15 @@ class EventLogger:
                     "confidence": confidence,
                     "video_url": video_url or "N/A"
                 })
+            logger.info(f"LOGGED: {location} - {camera} - {people_count} people")
         except Exception as e:
             logger.error(f"Logging error: {e}")
 
 
 app = FastAPI(title="Club 24 Tailgate Detector")
 blink_mgr = BlinkManager()
+vision = VisionAnalyzer()
+event_logger = EventLogger()
 
 
 @app.on_event("startup")
@@ -178,6 +282,7 @@ async def health_check():
     return {
         "status": "healthy",
         "blink_authenticated": blink_mgr.authenticated,
+        "vision_api_configured": vision.available,
         "cameras": len(blink_mgr.blink.cameras) if blink_mgr.blink and blink_mgr.blink.cameras else 0,
         "sync_modules": len(blink_mgr.blink.sync) if blink_mgr.blink and blink_mgr.blink.sync else 0,
         "account_id": blink_mgr.blink.account_id if blink_mgr.blink else None
@@ -202,30 +307,108 @@ async def get_videos(camera: Optional[str] = None):
     return {"timestamp": datetime.now().isoformat(), "videos": videos}
 
 
-@app.post("/check-tailgating")
-async def check_tailgating():
+@app.post("/analyze-camera")
+async def analyze_camera(camera_name: str):
+    """Analyze a specific camera for people"""
     if not blink_mgr.authenticated:
         return {"error": "Not authenticated"}
+    if not vision.available:
+        return {"error": "Vision API not configured"}
+    
+    # Get thumbnail from camera
+    image_data = await blink_mgr.get_camera_thumbnail(camera_name)
+    if not image_data:
+        return {"error": f"Could not get image from {camera_name}"}
+    
+    # Analyze with Vision API
+    result = await vision.count_people(image_data)
+    
+    # Log if tailgate detected
+    if result.get("is_tailgate"):
+        avg_conf = sum(result.get("person_scores", [0])) / max(len(result.get("person_scores", [1])), 1)
+        event_logger.log_event(
+            location=camera_name,
+            camera=camera_name,
+            people_count=result["people_count"],
+            confidence=round(avg_conf, 3)
+        )
+    
+    return {
+        "camera": camera_name,
+        "timestamp": datetime.now().isoformat(),
+        "analysis": result
+    }
+
+
+@app.post("/scan-all")
+async def scan_all_cameras():
+    """Scan ALL cameras for tailgating - main endpoint"""
+    if not blink_mgr.authenticated:
+        return {"error": "Not authenticated"}
+    if not vision.available:
+        return {"error": "Vision API not configured"}
+    
+    await blink_mgr.blink.refresh()
+    
     results = []
-    try:
-        videos = await blink_mgr.get_latest_videos()
-        for video in videos:
-            results.append({
-                "camera": video["camera_name"],
-                "camera_id": video["camera_id"],
-                "network_id": video["network_id"],
-                "motion_detected": video["motion_detected"],
-                "last_motion": video["last_motion"],
-                "clip_available": video["clip"] is not None,
-                "status": "MOTION" if video["motion_detected"] else "clear"
-            })
-    except Exception as e:
-        return {"error": str(e)}
+    alerts = []
+    
+    for cam_name, camera in blink_mgr.blink.cameras.items():
+        try:
+            # Get thumbnail
+            image_data = await blink_mgr.get_camera_thumbnail(cam_name)
+            if not image_data:
+                results.append({
+                    "camera": cam_name,
+                    "status": "no_image",
+                    "people_count": 0
+                })
+                continue
+            
+            # Analyze
+            analysis = await vision.count_people(image_data)
+            
+            is_tailgate = analysis.get("is_tailgate", False)
+            people_count = analysis.get("people_count", 0)
+            
+            result = {
+                "camera": cam_name,
+                "status": "TAILGATE_ALERT" if is_tailgate else "clear",
+                "people_count": people_count,
+                "person_scores": analysis.get("person_scores", []),
+                "motion_detected": camera.motion_detected
+            }
+            results.append(result)
+            
+            # Log tailgate events
+            if is_tailgate:
+                avg_conf = sum(analysis.get("person_scores", [0])) / max(len(analysis.get("person_scores", [1])), 1)
+                event_logger.log_event(
+                    location=cam_name,
+                    camera=cam_name,
+                    people_count=people_count,
+                    confidence=round(avg_conf, 3)
+                )
+                alerts.append(result)
+                logger.warning(f"🚨 TAILGATE: {cam_name} - {people_count} people detected!")
+            
+        except Exception as e:
+            logger.error(f"Error scanning {cam_name}: {e}")
+            results.append({"camera": cam_name, "status": "error", "error": str(e)})
+    
     return {
         "timestamp": datetime.now().isoformat(),
-        "checks_performed": len(results),
+        "cameras_scanned": len(results),
+        "tailgate_alerts": len(alerts),
+        "alerts": alerts,
         "results": results
     }
+
+
+@app.post("/check-tailgating")
+async def check_tailgating():
+    """Alias for scan-all"""
+    return await scan_all_cameras()
 
 
 @app.get("/logs")
