@@ -272,9 +272,7 @@ class BlinkManager:
                         "camera_id": camera.camera_id,
                         "network_id": camera.network_id,
                         "clip": camera.clip,
-                        "last_motion": str(camera.last_motion)
-                        if camera.last_motion
-                        else None,
+                        "last_motion": str(getattr(camera, "last_motion", None)) if getattr(camera, "last_motion", None) else None,
                         "motion_detected": camera.motion_detected,
                     }
                 )
@@ -405,7 +403,7 @@ async def continuous_scan_loop():
                         recipient = ALERT_CAMERAS[cam_name]
                         avg = sum(scores) / max(len(scores), 1)
                         cam_obj = blink_mgr.blink.cameras[cam_name]
-                        mt = str(cam_obj.last_motion) if cam_obj.last_motion else None
+                        mt = str(getattr(cam_obj, "last_motion", None)) if getattr(cam_obj, "last_motion", None) else None
                         sent = await send_alert_email(
                             cam_name, people, scores, recipient, mt
                         )
@@ -510,7 +508,7 @@ async def scan_all_cameras():
                 status = "TAILGATE_ALERT"
                 recip = ALERT_CAMERAS[cam_name]
                 avg = sum(scores) / max(len(scores), 1)
-                mt = str(camera.last_motion) if camera.last_motion else None
+                mt = str(getattr(camera, "last_motion", None)) if getattr(camera, "last_motion", None) else None
                 sent = await send_alert_email(
                     cam_name, people, scores, recip, mt
                 )
