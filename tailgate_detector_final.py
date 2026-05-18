@@ -216,6 +216,102 @@ class BlinkManager:
             logger.error("Video frame error for " + camera_name + ": " + str(e))
             return None
 
+    async def get_recent_clips(self, camera_name=None):
+        """Get recent recorded clips from Blink media library"""
+        clips = []
+        try:
+            if not self.blink or not self.authenticated:
+                return clips
+            await self.blink.refresh()
+
+            cameras_to_check = {}
+            if camera_name and camera_name in self.blink.cameras:
+                cameras_to_check = {camera_name: self.blink.cameras[camera_name]}
+            else:
+                for cam_name in ALERT_CAMERAS:
+                    if cam_name in self.blink.cameras:
+                        cameras_to_check[cam_name] = self.blink.cameras[cam_name]
+
+            for name, camera in cameras_to_check.items():
+                clip_url = camera.clip
+                last_motion = camera.last_motion
+                motion_detected = camera.motion_detected
+
+                if clip_url:
+                    clips.append({
+                        "camera_name": name,
+                        "clip_url": clip_url,
+                        "last_motion": str(last_motion) if last_motion else None,
+                        "motion_detected": motion_detected
+                    })
+
+            return clips
+        except Exception as e:
+            logger.error("Get clips error: " + str(e))
+            return clips
+
+    async def download_clip_frame(self, camera_name):
+        """Download a video clip and extract a frame using ffmpeg"""
+        try:
+            if not self.blink or camera_name not in self.blink.cameras:
+                return None
+
+            camera = self.blink.cameras[camera_name]
+            clip_url = camera.clip
+
+            if not clip_url:
+                logger.info("No clip for " + camera_name + " - using thumbnail")
+                return await self.get_camera_thumbnail(camera_name)
+
+            # Download the video clip
+            video_path = "/tmp/" + camera_name.replace(" ", "_") + "_clip.mp4"
+            frame_path = "/tmp/" + camera_name.replace(" ", "_") + "_frame.jpg"
+
+            try:
+                await camera.video_to_file(video_path)
+            except Exception as e:
+                logger.warning("Video download failed for " + camera_name + ": " + str(e))
+                return await self.get_camera_thumbnail(camera_name)
+
+            if not Path(video_path).exists() or Path(video_path).stat().st_size < 100:
+                logger.warning("Video file empty for " + camera_name)
+                return await self.get_camera_thumbnail(camera_name)
+
+            # Extract frame from middle of video using ffmpeg
+            import subprocess
+            try:
+                # Get video duration
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+                    capture_output=True, text=True, timeout=10
+                )
+                duration = float(probe.stdout.strip()) if probe.stdout.strip() else 5.0
+                midpoint = duration / 2
+
+                # Extract frame at midpoint
+                subprocess.run(
+                    ["ffmpeg", "-y", "-ss", str(midpoint), "-i", video_path,
+                     "-vframes", "1", "-q:v", "2", frame_path],
+                    capture_output=True, timeout=15
+                )
+
+                if Path(frame_path).exists() and Path(frame_path).stat().st_size > 100:
+                    with open(frame_path, "rb") as fh:
+                        logger.info("Extracted frame from clip for " + camera_name)
+                        return fh.read()
+            except FileNotFoundError:
+                logger.warning("ffmpeg not installed - using thumbnail")
+            except Exception as e:
+                logger.warning("Frame extraction failed: " + str(e))
+
+            # Fallback to thumbnail
+            return await self.get_camera_thumbnail(camera_name)
+
+        except Exception as e:
+            logger.error("Clip frame error for " + camera_name + ": " + str(e))
+            return await self.get_camera_thumbnail(camera_name)
+
     async def get_latest_videos(self, camera_name=None):
         videos = []
         try:
@@ -436,7 +532,7 @@ async def scan_all_cameras():
 
     for cam_name, camera in blink_mgr.blink.cameras.items():
         try:
-            image_data = await blink_mgr.get_camera_thumbnail(cam_name)
+            image_data = await blink_mgr.download_clip_frame(cam_name)
             if not image_data:
                 results.append({"camera": cam_name, "status": "no_image"})
                 continue
