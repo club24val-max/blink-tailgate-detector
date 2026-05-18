@@ -58,7 +58,7 @@ def is_unstaffed_hours():
         return hour >= 15 or hour < 8
 
 
-async def send_alert_email(camera_name, people_count, scores, recipient):
+async def send_alert_email(camera_name, people_count, scores, recipient, motion_time=None):
     try:
         now = now_et()
         time_str = now.strftime("%I:%M %p ET")
@@ -79,6 +79,7 @@ async def send_alert_email(camera_name, people_count, scores, recipient):
             '<p style="margin:5px 0;"><strong>Time:</strong> ' + time_str + '</p>'
             '<p style="margin:5px 0;"><strong>Date:</strong> ' + date_str + '</p>'
             '<p style="margin:5px 0;"><strong>Confidence:</strong> ' + conf_str + '</p>'
+            + ('<p style="margin:5px 0;"><strong>Motion Detected:</strong> ' + str(motion_time) + '</p>' if motion_time else '')
             '</div>'
             '<p style="color:#E24B4A;font-weight:bold;font-size:16px;">'
             'ACTION REQUIRED: Open the Blink app to review footage now.</p>'
@@ -88,7 +89,7 @@ async def send_alert_email(camera_name, people_count, scores, recipient):
             '</div></div>'
         )
 
-        text = "TAILGATE ALERT - " + camera_name + " - " + str(people_count) + " people at " + time_str
+        text = "TAILGATE ALERT - " + camera_name + " - " + str(people_count) + " people at " + time_str + (" | Motion: " + str(motion_time) if motion_time else "")
 
         payload = {
             "to": recipient,
@@ -317,8 +318,9 @@ async def continuous_scan_loop():
                     if result.get("is_tailgate"):
                         recipient = ALERT_CAMERAS[cam_name]
                         avg_conf = sum(scores) / max(len(scores), 1)
+                        motion_time = str(blink_mgr.blink.cameras[cam_name].last_motion) if blink_mgr.blink.cameras[cam_name].last_motion else None
 
-                        email_sent = await send_alert_email(cam_name, people, scores, recipient)
+                        email_sent = await send_alert_email(cam_name, people, scores, recipient, motion_time)
 
                         event_logger.log_event(
                             location=cam_name, camera=cam_name,
@@ -418,9 +420,10 @@ async def scan_all_cameras():
                 status = "TAILGATE_ALERT"
                 recipient = ALERT_CAMERAS[cam_name]
                 avg_conf = sum(scores) / max(len(scores), 1)
-                email_sent = await send_alert_email(cam_name, people, scores, recipient)
+                motion_time = str(camera.last_motion) if camera.last_motion else None
+                email_sent = await send_alert_email(cam_name, people, scores, recipient, motion_time)
                 event_logger.log_event(cam_name, cam_name, people, round(avg_conf, 3), email_sent)
-                alerts.append({"camera": cam_name, "people": people, "email_sent": email_sent})
+                alerts.append({"camera": cam_name, "people": people, "email_sent": email_sent, "motion_time": motion_time})
             elif is_tailgate:
                 status = "people_detected"
 
