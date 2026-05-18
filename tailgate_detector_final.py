@@ -1,6 +1,6 @@
 """
 Club 24 Blink Tailgate Detection System
-Continuous scanning + Email alerts during unstaffed hours
+Continuous scanning + Email alerts via Google Apps Script
 """
 
 import os
@@ -8,15 +8,11 @@ import json
 import asyncio
 import csv
 import base64
-import smtplib
 import aiohttp
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 import logging
-from contextlib import asynccontextmanager
 
 from aiohttp import ClientSession
 from blinkpy.blinkpy import Blink
@@ -31,11 +27,11 @@ BLINK_CREDS = os.getenv("BLINK_CREDS", "")
 BLINK_CREDS_FILE = "./blink_credentials.json"
 TAILGATE_LOG_CSV = "./tailgate_events.csv"
 VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
-GMAIL_SENDER = "club24contactus@gmail.com"
 PEOPLE_THRESHOLD = 2
 CONFIDENCE_THRESHOLD = 0.5
-SCAN_INTERVAL_SECONDS = 120  # Scan every 2 minutes
+SCAN_INTERVAL_SECONDS = 120
+
+EMAIL_WEBHOOK = "https://script.google.com/macros/s/AKfycbzWr-xlOnq2ayUuFuU8ruJ3jRl4SItNRtmAD8wZY4vwq6AwTpw_XoVusyN5FjyyQSJ1/exec"
 
 ALERT_CAMERAS = {
     "Wallingford Front Door": "club24wf@gmail.com",
@@ -63,31 +59,36 @@ def is_unstaffed_hours():
 
 
 async def send_alert_email(camera_name, people_count, scores, recipient):
-    """Send alert via Google Apps Script webhook"""
     try:
         now = now_et()
-        subject = f"TAILGATE ALERT - {camera_name} - {people_count} people detected"
-        html = f"""<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
-<div style="background:#E24B4A;color:white;padding:20px;border-radius:8px 8px 0 0;">
-<h1 style="margin:0;font-size:22px;">TAILGATE ALERT</h1>
-<p style="margin:5px 0 0;opacity:0.9;">Club 24 Security</p></div>
-<div style="background:white;padding:20px;border:1px solid #ddd;border-radius:0 0 8px 8px;">
-<div style="background:#FFF3F3;border-left:4px solid #E24B4A;padding:15px;margin-bottom:20px;">
-<h2 style="margin:0 0 10px;color:#E24B4A;">{people_count} People Detected</h2>
-<p style="margin:0;"><strong>Location:</strong> {camera_name}</p>
-<p style="margin:5px 0;"><strong>Time:</strong> {now.strftime("%I:%M %p ET")}</p>
-<p style="margin:5px 0;"><strong>Date:</strong> {now.strftime("%A, %B %d, %Y")}</p>
-<p style="margin:5px 0;"><strong>Confidence:</strong> {", ".join([f"{s:.0%}" for s in scores])}</p>
-</div>
-<p style="color:#E24B4A;font-weight:bold;font-size:16px;">
-ACTION REQUIRED: Open the Blink app to review footage now.</p>
-<hr style="border:none;border-top:1px solid #eee;margin:20px 0;">
-<p style="color:#999;font-size:12px;">
-Club 24 Tailgate Detection System | Mon-Fri 9pm-8am | Sat-Sun 3pm-8am ET</p>
-</div></div>"""
-        text = f"TAILGATE ALERT - {camera_name} - {people_count} people at {now.strftime('%I:%M %p ET')}"
+        time_str = now.strftime("%I:%M %p ET")
+        date_str = now.strftime("%A, %B %d, %Y")
+        conf_str = ", ".join([str(round(s * 100)) + "%" for s in scores])
 
-        webhook_url = "https://script.google.com/macros/s/AKfycbzWr-xlOnq2ayUuFuU8ruJ3jRl4SItNRtmAD8wZY4vwq6AwTpw_XoVusyN5FjyyQSJ1/exec"
+        subject = "TAILGATE ALERT - " + camera_name + " - " + str(people_count) + " people detected"
+
+        html = (
+            '<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">'
+            '<div style="background:#E24B4A;color:white;padding:20px;border-radius:8px 8px 0 0;">'
+            '<h1 style="margin:0;font-size:22px;">TAILGATE ALERT</h1>'
+            '<p style="margin:5px 0 0;opacity:0.9;">Club 24 Security</p></div>'
+            '<div style="background:white;padding:20px;border:1px solid #ddd;border-radius:0 0 8px 8px;">'
+            '<div style="background:#FFF3F3;border-left:4px solid #E24B4A;padding:15px;margin-bottom:20px;">'
+            '<h2 style="margin:0 0 10px;color:#E24B4A;">' + str(people_count) + ' People Detected</h2>'
+            '<p style="margin:0;"><strong>Location:</strong> ' + camera_name + '</p>'
+            '<p style="margin:5px 0;"><strong>Time:</strong> ' + time_str + '</p>'
+            '<p style="margin:5px 0;"><strong>Date:</strong> ' + date_str + '</p>'
+            '<p style="margin:5px 0;"><strong>Confidence:</strong> ' + conf_str + '</p>'
+            '</div>'
+            '<p style="color:#E24B4A;font-weight:bold;font-size:16px;">'
+            'ACTION REQUIRED: Open the Blink app to review footage now.</p>'
+            '<hr style="border:none;border-top:1px solid #eee;margin:20px 0;">'
+            '<p style="color:#999;font-size:12px;">'
+            'Club 24 Tailgate Detection System</p>'
+            '</div></div>'
+        )
+
+        text = "TAILGATE ALERT - " + camera_name + " - " + str(people_count) + " people at " + time_str
 
         payload = {
             "to": recipient,
@@ -97,77 +98,17 @@ Club 24 Tailgate Detection System | Mon-Fri 9pm-8am | Sat-Sun 3pm-8am ET</p>
         }
 
         async with aiohttp.ClientSession() as session:
-            async with session.post(webhook_url, json=payload) as resp:
+            async with session.post(EMAIL_WEBHOOK, json=payload, allow_redirects=True) as resp:
+                logger.info("Email webhook response: " + str(resp.status))
                 if resp.status == 200 or resp.status == 302:
-                    logger.info(f"EMAIL SENT to {recipient} for {camera_name}")
+                    logger.info("EMAIL SENT to " + recipient + " for " + camera_name)
                     return True
                 else:
                     body = await resp.text()
-                    logger.error(f"Email webhook error: {resp.status} - {body}")
+                    logger.error("Email webhook error: " + str(resp.status) + " - " + body)
                     return False
     except Exception as e:
-        logger.error(f"Email error: {e}")
-        return False
-<body style="font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5;">
-<div style="max-width: 600px; margin: 0 auto; background: white; border-radius: 8px; overflow: hidden;">
-<div style="background: #E24B4A; color: white; padding: 20px;">
-<h1 style="margin: 0; font-size: 22px;">TAILGATE ALERT</h1>
-<p style="margin: 5px 0 0; opacity: 0.9;">Club 24 Security Monitoring</p>
-</div>
-<div style="padding: 20px;">
-<div style="background: #FFF3F3; border-left: 4px solid #E24B4A; padding: 15px; margin-bottom: 20px;">
-<h2 style="margin: 0 0 10px; color: #E24B4A;">{people_count} People Detected</h2>
-<p style="margin: 0; color: #333;"><strong>Location:</strong> {location}</p>
-<p style="margin: 5px 0; color: #333;"><strong>Time:</strong> {now.strftime("%I:%M %p ET")}</p>
-<p style="margin: 5px 0; color: #333;"><strong>Date:</strong> {now.strftime("%A, %B %d, %Y")}</p>
-<p style="margin: 5px 0; color: #333;"><strong>Confidence:</strong> {", ".join([f"{s:.0%}" for s in scores])}</p>
-</div>
-<p style="color: #E24B4A; font-weight: bold; font-size: 16px;">
-ACTION REQUIRED: Open the Blink app to review footage now.
-</p>
-<hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
-<p style="color: #999; font-size: 12px;">
-Club 24 Tailgate Detection System<br>
-Monitoring: Mon-Fri 9pm-8am | Sat-Sun 3pm-8am ET<br>
-Alert threshold: {PEOPLE_THRESHOLD}+ people at front door
-</p>
-</div>
-</div>
-</body>
-</html>"""
-
-        raw_email = f"From: {GMAIL_SENDER}\r\nTo: {recipient}\r\nSubject: {subject}\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html_body}"
-        encoded = base64.urlsafe_b64encode(raw_email.encode()).decode()
-
-        # Use Gmail SMTP relay via aiohttp to an SMTP-to-HTTP bridge
-        # Fallback: use a simple HTTP webhook approach
-        # Direct approach: use smtplib in a thread to avoid blocking
-        import concurrent.futures
-        def _send_smtp():
-            import smtplib as s
-            from email.mime.text import MIMEText as MT
-            from email.mime.multipart import MIMEMultipart as MM
-            msg = MM("alternative")
-            msg["Subject"] = subject
-            msg["From"] = GMAIL_SENDER
-            msg["To"] = recipient
-            msg.attach(MT(html_body, "html"))
-            with s.SMTP("smtp.gmail.com", 587, timeout=10) as srv:
-                srv.ehlo()
-                srv.starttls()
-                srv.ehlo()
-                srv.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
-                srv.sendmail(GMAIL_SENDER, [recipient, GMAIL_SENDER], msg.as_string())
-            return True
-
-        loop = asyncio.get_event_loop()
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            result = await loop.run_in_executor(pool, _send_smtp)
-
-        logger.info(f"EMAIL SENT to {recipient} for {camera_name}")
-        return True
-    except Exception as e:
-        logger.error(f"Email error: {e}")
+        logger.error("Email error: " + str(e))
         return False
 
 
@@ -191,7 +132,7 @@ class BlinkManager:
             try:
                 await self.blink.start()
             except Exception as e:
-                logger.warning(f"Start exception: {e}")
+                logger.warning("Start exception: " + str(e))
                 return False
             if self.blink.cameras:
                 self.authenticated = True
@@ -201,7 +142,7 @@ class BlinkManager:
                 return True
             return False
         except Exception as e:
-            logger.error(f"Auth error: {e}")
+            logger.error("Auth error: " + str(e))
             return False
 
     async def discover_cameras(self):
@@ -224,23 +165,23 @@ class BlinkManager:
                             "network_id": camera.network_id
                         })
                         break
-            logger.info(f"Discovered {len(self.blink.cameras)} cameras")
+            logger.info("Discovered " + str(len(self.blink.cameras)) + " cameras")
         except Exception as e:
-            logger.error(f"Discovery error: {e}")
+            logger.error("Discovery error: " + str(e))
 
     async def get_camera_thumbnail(self, camera_name):
         try:
             if not self.blink or camera_name not in self.blink.cameras:
                 return None
             camera = self.blink.cameras[camera_name]
-            tmp_path = f"/tmp/{camera_name.replace(' ', '_')}_thumb.jpg"
+            tmp_path = "/tmp/" + camera_name.replace(" ", "_") + "_thumb.jpg"
             await camera.image_to_file(tmp_path)
             if Path(tmp_path).exists():
-                with open(tmp_path, "rb") as f:
-                    return f.read()
+                with open(tmp_path, "rb") as fh:
+                    return fh.read()
             return None
         except Exception as e:
-            logger.error(f"Thumbnail error: {e}")
+            logger.error("Thumbnail error: " + str(e))
             return None
 
     async def get_latest_videos(self, camera_name=None):
@@ -265,14 +206,14 @@ class BlinkManager:
                 })
             return videos
         except Exception as e:
-            logger.error(f"Videos error: {e}")
+            logger.error("Videos error: " + str(e))
             return videos
 
 
 class VisionAnalyzer:
     def __init__(self):
         self.api_key = VISION_API_KEY
-        self.api_url = f"https://vision.googleapis.com/v1/images:annotate?key={self.api_key}"
+        self.api_url = "https://vision.googleapis.com/v1/images:annotate?key=" + self.api_key
         self.available = bool(self.api_key)
 
     async def count_people(self, image_data):
@@ -283,15 +224,13 @@ class VisionAnalyzer:
             payload = {
                 "requests": [{
                     "image": {"content": b64},
-                    "features": [
-                        {"type": "OBJECT_LOCALIZATION", "maxResults": 20}
-                    ]
+                    "features": [{"type": "OBJECT_LOCALIZATION", "maxResults": 20}]
                 }]
             }
             async with aiohttp.ClientSession() as session:
                 async with session.post(self.api_url, json=payload) as resp:
                     if resp.status != 200:
-                        return {"people_count": 0, "error": f"API {resp.status}"}
+                        return {"people_count": 0, "error": "API " + str(resp.status)}
                     data = await resp.json()
             response = data.get("responses", [{}])[0]
             people_count = 0
@@ -306,7 +245,7 @@ class VisionAnalyzer:
                 "is_tailgate": people_count >= PEOPLE_THRESHOLD
             }
         except Exception as e:
-            logger.error(f"Vision error: {e}")
+            logger.error("Vision error: " + str(e))
             return {"people_count": 0, "error": str(e)}
 
 
@@ -315,8 +254,8 @@ class EventLogger:
     def log_event(location, camera, people_count, confidence, email_sent=False):
         file_exists = Path(TAILGATE_LOG_CSV).exists()
         try:
-            with open(TAILGATE_LOG_CSV, "a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=[
+            with open(TAILGATE_LOG_CSV, "a", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=[
                     "timestamp", "location", "camera_name", "people_count",
                     "confidence", "email_sent"
                 ])
@@ -331,19 +270,16 @@ class EventLogger:
                     "email_sent": email_sent
                 })
         except Exception as e:
-            logger.error(f"Log error: {e}")
+            logger.error("Log error: " + str(e))
 
 
-# Global state
 blink_mgr = BlinkManager()
-vision = VisionAnalyzer()
+vision_api = VisionAnalyzer()
 event_logger = EventLogger()
-scan_task = None
 scan_stats = {"total_scans": 0, "last_scan": None, "alerts_sent": 0, "running": False}
 
 
 async def continuous_scan_loop():
-    """Background loop that scans cameras during unstaffed hours"""
     scan_stats["running"] = True
     logger.info("Continuous scan loop started")
 
@@ -351,7 +287,7 @@ async def continuous_scan_loop():
         try:
             if not is_unstaffed_hours():
                 scan_stats["running"] = False
-                logger.info(f"Staffed hours - sleeping 5 min ({now_et().strftime('%I:%M %p ET')})")
+                logger.info("Staffed hours - sleeping 5 min")
                 await asyncio.sleep(300)
                 continue
 
@@ -361,7 +297,7 @@ async def continuous_scan_loop():
                 continue
 
             scan_stats["running"] = True
-            logger.info(f"Scanning all cameras ({now_et().strftime('%I:%M %p ET')})")
+            logger.info("Scanning cameras at " + now_et().strftime("%I:%M %p ET"))
 
             await blink_mgr.blink.refresh()
 
@@ -374,7 +310,7 @@ async def continuous_scan_loop():
                     if not image_data:
                         continue
 
-                    result = await vision.count_people(image_data)
+                    result = await vision_api.count_people(image_data)
                     people = result.get("people_count", 0)
                     scores = result.get("person_scores", [])
 
@@ -390,19 +326,18 @@ async def continuous_scan_loop():
                             email_sent=email_sent
                         )
                         scan_stats["alerts_sent"] += 1
-                        logger.warning(f"TAILGATE: {cam_name} - {people} people - email: {email_sent}")
+                        logger.warning("TAILGATE: " + cam_name + " - " + str(people) + " people - email: " + str(email_sent))
 
                 except Exception as e:
-                    logger.error(f"Scan error {cam_name}: {e}")
+                    logger.error("Scan error " + cam_name + ": " + str(e))
 
             scan_stats["total_scans"] += 1
             scan_stats["last_scan"] = now_et().isoformat()
-            logger.info(f"Scan complete. Total: {scan_stats['total_scans']}, Alerts: {scan_stats['alerts_sent']}")
 
             await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
         except Exception as e:
-            logger.error(f"Loop error: {e}")
+            logger.error("Loop error: " + str(e))
             await asyncio.sleep(30)
 
 
@@ -411,10 +346,9 @@ app = FastAPI(title="Club 24 Tailgate Detector")
 
 @app.on_event("startup")
 async def startup_event():
-    global scan_task
     logger.info("Club 24 Tailgate Detector Starting...")
     await blink_mgr.authenticate()
-    scan_task = asyncio.create_task(continuous_scan_loop())
+    asyncio.create_task(continuous_scan_loop())
     logger.info("Background scan loop started")
 
 
@@ -423,8 +357,8 @@ async def health_check():
     return {
         "status": "healthy",
         "blink_authenticated": blink_mgr.authenticated,
-        "vision_api": vision.available,
-        "email_configured": bool(GMAIL_APP_PASSWORD),
+        "vision_api": vision_api.available,
+        "email_webhook": bool(EMAIL_WEBHOOK),
         "cameras": len(blink_mgr.blink.cameras) if blink_mgr.blink and blink_mgr.blink.cameras else 0,
         "account_id": blink_mgr.blink.account_id if blink_mgr.blink else None,
         "current_time_et": now_et().strftime("%I:%M %p ET - %A"),
@@ -447,34 +381,21 @@ async def list_cameras():
     }
 
 
-@app.get("/videos")
-async def get_videos(camera: Optional[str] = None):
-    if not blink_mgr.authenticated:
-        return {"error": "Not authenticated"}
-    videos = await blink_mgr.get_latest_videos(camera)
-    return {"timestamp": now_et().isoformat(), "videos": videos}
-
-
 @app.post("/analyze-camera")
 async def analyze_camera(camera_name: str):
     if not blink_mgr.authenticated:
         return {"error": "Not authenticated"}
-    if not vision.available:
-        return {"error": "Vision API not configured"}
     image_data = await blink_mgr.get_camera_thumbnail(camera_name)
     if not image_data:
-        return {"error": f"No image from {camera_name}"}
-    result = await vision.count_people(image_data)
+        return {"error": "No image from " + camera_name}
+    result = await vision_api.count_people(image_data)
     return {"camera": camera_name, "timestamp": now_et().isoformat(), "analysis": result}
 
 
 @app.post("/scan-all")
 async def scan_all_cameras():
-    """Force scan all cameras right now"""
     if not blink_mgr.authenticated:
         return {"error": "Not authenticated"}
-    if not vision.available:
-        return {"error": "Vision API not configured"}
 
     await blink_mgr.blink.refresh()
     results = []
@@ -486,7 +407,7 @@ async def scan_all_cameras():
             if not image_data:
                 results.append({"camera": cam_name, "status": "no_image"})
                 continue
-            analysis = await vision.count_people(image_data)
+            analysis = await vision_api.count_people(image_data)
             people = analysis.get("people_count", 0)
             scores = analysis.get("person_scores", [])
             is_alert_cam = cam_name in ALERT_CAMERAS
@@ -534,8 +455,8 @@ async def scheduled_scan():
 async def get_logs(limit: int = 50):
     events = []
     if Path(TAILGATE_LOG_CSV).exists():
-        with open(TAILGATE_LOG_CSV, "r") as f:
-            reader = csv.DictReader(f)
+        with open(TAILGATE_LOG_CSV, "r") as fh:
+            reader = csv.DictReader(fh)
             events = list(reader)[-limit:]
     return {"events": events, "total": len(events)}
 
@@ -545,8 +466,8 @@ async def get_stats():
     if not Path(TAILGATE_LOG_CSV).exists():
         return {"total_events": 0, "by_location": {}}
     stats = {"total_events": 0, "by_location": {}}
-    with open(TAILGATE_LOG_CSV, "r") as f:
-        reader = csv.DictReader(f)
+    with open(TAILGATE_LOG_CSV, "r") as fh:
+        reader = csv.DictReader(fh)
         for row in reader:
             stats["total_events"] += 1
             loc = row.get("location", "Unknown")
@@ -558,14 +479,14 @@ async def get_stats():
 async def get_schedule():
     return {
         "unstaffed_hours": {
-            "mon_fri": "9:00 PM - 8:00 AM ET",
-            "sat_sun": "3:00 PM - 8:00 AM ET"
+            "mon_fri": "9:00 PM to 8:00 AM ET",
+            "sat_sun": "3:00 PM to 8:00 AM ET"
         },
-        "scan_interval": f"Every {SCAN_INTERVAL_SECONDS} seconds",
+        "scan_interval_seconds": SCAN_INTERVAL_SECONDS,
         "alert_cameras": ALERT_CAMERAS,
         "people_threshold": PEOPLE_THRESHOLD,
         "currently_unstaffed": is_unstaffed_hours(),
-        "email_from": GMAIL_SENDER,
+        "email_webhook": "Google Apps Script",
         "mode": "Continuous background scanning"
     }
 
