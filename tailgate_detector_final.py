@@ -63,16 +63,51 @@ def is_unstaffed_hours():
 
 
 async def send_alert_email(camera_name, people_count, scores, recipient):
-    """Send tailgate alert email via Gmail API"""
-    if not GMAIL_APP_PASSWORD:
-        logger.warning("No Gmail app password - skipping email")
-        return False
+    """Send alert via Google Apps Script webhook"""
     try:
         now = now_et()
-        location = camera_name
+        subject = f"TAILGATE ALERT - {camera_name} - {people_count} people detected"
+        html = f"""<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+<div style="background:#E24B4A;color:white;padding:20px;border-radius:8px 8px 0 0;">
+<h1 style="margin:0;font-size:22px;">TAILGATE ALERT</h1>
+<p style="margin:5px 0 0;opacity:0.9;">Club 24 Security</p></div>
+<div style="background:white;padding:20px;border:1px solid #ddd;border-radius:0 0 8px 8px;">
+<div style="background:#FFF3F3;border-left:4px solid #E24B4A;padding:15px;margin-bottom:20px;">
+<h2 style="margin:0 0 10px;color:#E24B4A;">{people_count} People Detected</h2>
+<p style="margin:0;"><strong>Location:</strong> {camera_name}</p>
+<p style="margin:5px 0;"><strong>Time:</strong> {now.strftime("%I:%M %p ET")}</p>
+<p style="margin:5px 0;"><strong>Date:</strong> {now.strftime("%A, %B %d, %Y")}</p>
+<p style="margin:5px 0;"><strong>Confidence:</strong> {", ".join([f"{s:.0%}" for s in scores])}</p>
+</div>
+<p style="color:#E24B4A;font-weight:bold;font-size:16px;">
+ACTION REQUIRED: Open the Blink app to review footage now.</p>
+<hr style="border:none;border-top:1px solid #eee;margin:20px 0;">
+<p style="color:#999;font-size:12px;">
+Club 24 Tailgate Detection System | Mon-Fri 9pm-8am | Sat-Sun 3pm-8am ET</p>
+</div></div>"""
+        text = f"TAILGATE ALERT - {camera_name} - {people_count} people at {now.strftime('%I:%M %p ET')}"
 
-        subject = f"TAILGATE ALERT - {location} - {people_count} people detected"
-        html_body = f"""<html>
+        webhook_url = "https://script.google.com/macros/s/AKfycbzWr-xlOnq2ayUuFuU8ruJ3jRl4SItNRtmAD8wZY4vwq6AwTpw_XoVusyN5FjyyQSJ1/exec"
+
+        payload = {
+            "to": recipient,
+            "subject": subject,
+            "text": text,
+            "html": html
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(webhook_url, json=payload) as resp:
+                if resp.status == 200 or resp.status == 302:
+                    logger.info(f"EMAIL SENT to {recipient} for {camera_name}")
+                    return True
+                else:
+                    body = await resp.text()
+                    logger.error(f"Email webhook error: {resp.status} - {body}")
+                    return False
+    except Exception as e:
+        logger.error(f"Email error: {e}")
+        return False
 <body style="font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5;">
 <div style="max-width: 600px; margin: 0 auto; background: white; border-radius: 8px; overflow: hidden;">
 <div style="background: #E24B4A; color: white; padding: 20px;">
