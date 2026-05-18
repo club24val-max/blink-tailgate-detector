@@ -62,8 +62,8 @@ def is_unstaffed_hours():
         return hour >= 15 or hour < 8
 
 
-def send_alert_email(camera_name, people_count, scores, recipient):
-    """Send tailgate alert email"""
+async def send_alert_email(camera_name, people_count, scores, recipient):
+    """Send tailgate alert email via Gmail API"""
     if not GMAIL_APP_PASSWORD:
         logger.warning("No Gmail app password - skipping email")
         return False
@@ -71,28 +71,8 @@ def send_alert_email(camera_name, people_count, scores, recipient):
         now = now_et()
         location = camera_name
 
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"TAILGATE ALERT - {location} - {people_count} people detected"
-        msg["From"] = GMAIL_SENDER
-        msg["To"] = recipient
-
-        text = f"""TAILGATE ALERT - Club 24 Security
-
-Location: {location}
-Camera: {camera_name}
-Time: {now.strftime("%I:%M %p ET - %A %B %d, %Y")}
-People Detected: {people_count}
-Confidence Scores: {", ".join([f"{s:.0%}" for s in scores])}
-
-ACTION REQUIRED: Check the Blink app immediately to review footage.
-
-This is an automated alert from Club 24 Tailgate Detection System.
-Alerts are sent during unstaffed hours only.
-Mon-Fri: 9pm - 8am | Sat-Sun: 3pm - 8am
-"""
-
-        html = f"""
-<html>
+        subject = f"TAILGATE ALERT - {location} - {people_count} people detected"
+        html_body = f"""<html>
 <body style="font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5;">
 <div style="max-width: 600px; margin: 0 auto; background: white; border-radius: 8px; overflow: hidden;">
 <div style="background: #E24B4A; color: white; padding: 20px;">
@@ -119,18 +99,35 @@ Alert threshold: {PEOPLE_THRESHOLD}+ people at front door
 </div>
 </div>
 </body>
-</html>
-"""
+</html>"""
 
-        msg.attach(MIMEText(text, "plain"))
-        msg.attach(MIMEText(html, "html"))
+        raw_email = f"From: {GMAIL_SENDER}\r\nTo: {recipient}\r\nSubject: {subject}\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html_body}"
+        encoded = base64.urlsafe_b64encode(raw_email.encode()).decode()
 
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_SENDER, [recipient, GMAIL_SENDER], msg.as_string())
+        # Use Gmail SMTP relay via aiohttp to an SMTP-to-HTTP bridge
+        # Fallback: use a simple HTTP webhook approach
+        # Direct approach: use smtplib in a thread to avoid blocking
+        import concurrent.futures
+        def _send_smtp():
+            import smtplib as s
+            from email.mime.text import MIMEText as MT
+            from email.mime.multipart import MIMEMultipart as MM
+            msg = MM("alternative")
+            msg["Subject"] = subject
+            msg["From"] = GMAIL_SENDER
+            msg["To"] = recipient
+            msg.attach(MT(html_body, "html"))
+            with s.SMTP("smtp.gmail.com", 587, timeout=10) as srv:
+                srv.ehlo()
+                srv.starttls()
+                srv.ehlo()
+                srv.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
+                srv.sendmail(GMAIL_SENDER, [recipient, GMAIL_SENDER], msg.as_string())
+            return True
+
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            result = await loop.run_in_executor(pool, _send_smtp)
 
         logger.info(f"EMAIL SENT to {recipient} for {camera_name}")
         return True
@@ -350,7 +347,7 @@ async def continuous_scan_loop():
                         recipient = ALERT_CAMERAS[cam_name]
                         avg_conf = sum(scores) / max(len(scores), 1)
 
-                        email_sent = send_alert_email(cam_name, people, scores, recipient)
+                        email_sent = await send_alert_email(cam_name, people, scores, recipient)
 
                         event_logger.log_event(
                             location=cam_name, camera=cam_name,
@@ -465,7 +462,7 @@ async def scan_all_cameras():
                 status = "TAILGATE_ALERT"
                 recipient = ALERT_CAMERAS[cam_name]
                 avg_conf = sum(scores) / max(len(scores), 1)
-                email_sent = send_alert_email(cam_name, people, scores, recipient)
+                email_sent = await send_alert_email(cam_name, people, scores, recipient)
                 event_logger.log_event(cam_name, cam_name, people, round(avg_conf, 3), email_sent)
                 alerts.append({"camera": cam_name, "people": people, "email_sent": email_sent})
             elif is_tailgate:
