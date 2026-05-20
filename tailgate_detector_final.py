@@ -42,6 +42,9 @@ ALERT_CAMERAS = {
 
 ET = timezone(timedelta(hours=-4))
 
+# Track already-alerted clips to avoid duplicate alerts
+alerted_clips = {}
+
 
 def now_et():
     return datetime.now(ET)
@@ -400,6 +403,18 @@ async def continuous_scan_loop():
                     people = result.get("people_count", 0)
                     scores = result.get("person_scores", [])
                     if result.get("is_tailgate"):
+                        # Get current clip URL
+                        current_clip = getattr(blink_mgr.blink.cameras[cam_name], "clip", None)
+                        
+                        # Skip if we already alerted on this exact clip
+                        if current_clip and alerted_clips.get(cam_name) == current_clip:
+                            logger.info("Already alerted on this clip for " + cam_name + " - skipping")
+                            continue
+                        
+                        # Mark this clip as alerted
+                        if current_clip:
+                            alerted_clips[cam_name] = current_clip
+                        
                         recipient = ALERT_CAMERAS[cam_name]
                         avg = sum(scores) / max(len(scores), 1)
                         cam_obj = blink_mgr.blink.cameras[cam_name]
